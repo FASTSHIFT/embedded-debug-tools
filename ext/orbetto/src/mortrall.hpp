@@ -115,6 +115,7 @@ struct CallStackBuffer
     perfetto::protos::FtraceEvent *proto_buffer[MAX_BUFFER_SIZE];       /* Buffer for protobuf */
     uint16_t instruction_counts[MAX_BUFFER_SIZE];                       /* Instruction count */
     uint64_t global_interpolations[MAX_BUFFER_SIZE];                    /* Global timestamps */
+    uint64_t fpga_ns_buffer[MAX_BUFFER_SIZE];                          /* FPGA wall-clock ns per event (doc 15 §25) */
     int proto_buffer_index{0};                                          /* Index for the buffer */
 }csb;
 
@@ -160,6 +161,17 @@ class Mortrall
         static inline enum verbLevel verbose;                                       // Verbosity level
         static inline uint64_t cps;                                                 // Clocks per second of used cpu
         static inline uint64_t cycleCountThreshold;                                 // cycle count threshold from which debugging information is output
+
+        /* FPGA capture-time base (doc 15 §25): the F429 ETM has no usable
+         * wall-clock (cycleCount is always 0), so an external authoritative
+         * time is provided per ETM byte by the FPGA capture side. orbetto calls
+         * set_fpga_ns() with the current byte's ns BEFORE pumping it; when
+         * use_fpga_time is set, event timestamps come straight from this ns
+         * instead of the (degenerate) cycleCount path. The call-stack
+         * reconstruction is unchanged. */
+        static inline bool use_fpga_time{false};
+        static inline uint64_t fpga_ns{0};
+        static void inline set_fpga_ns(uint64_t ns) { Mortrall::fpga_ns = ns; }
 
         /* Default Constructor */
         constexpr Mortrall()
@@ -628,8 +640,12 @@ class Mortrall
 
         static void inline _init()
         {
-            /* Init ETM4 Decoder */
-            TRACEprotocol trp = TRACE_PROT_ETM4;
+            /* Init ETM Decoder. NOTE: orbetto upstream hardcodes ETM4 (their
+               STM32F765/H7 targets). Our STM32F429 core is ETMv3.5, and the
+               Mortrall body already handles TRACE_PROT_ETM35 (disposition-bit
+               execution model). Select ETM3.5 here so the A7-Lite ETM stream
+               decodes (doc 15 §20). */
+            TRACEprotocol trp = TRACE_PROT_ETM35;
             Mortrall::Mortrall::r->protocol = trp;
             TRACEDecoderInit( &Mortrall::Mortrall::r->i, trp, true, _traceReport );
             /* Init Debug counters */
@@ -697,6 +713,10 @@ class Mortrall
             /* As the instruction count interpolation cannot be applied before the next cycle count is received store the event in a buffer */
             csb.proto_buffer[csb.proto_buffer_index] = event;
             csb.instruction_counts[csb.proto_buffer_index] = Mortrall::r->instruction_count + offset;
+            /* Record the current FPGA wall-clock ns alongside the event (doc 15
+             * §25). Used instead of the cycleCount interpolation when
+             * use_fpga_time is set. */
+            csb.fpga_ns_buffer[csb.proto_buffer_index] = Mortrall::fpga_ns;
             if (Mortrall::r->i.cpu.cycleCount == COUNT_UNKNOWN && Mortrall::r->callStack->perfettoStackDepth == -1){
                 /* The first packet sometimes still has an unknown cycle count however it is actually 0 */
                 csb.global_interpolations[csb.proto_buffer_index] = 0;
@@ -834,8 +854,19 @@ class Mortrall
             for (int i = 0; i < csb.proto_buffer_index; i++)
             {
                 auto *event = csb.proto_buffer[i];
-                uint64_t interpolation = csb.global_interpolations[i] + (uint64_t)_get_ic_percentage(i);
-                uint64_t ns = (uint64_t)((interpolation * 1'000'000'000) / Mortrall::cps);
+                uint64_t ns;
+                if (Mortrall::use_fpga_time)
+                {
+                    /* FPGA wall-clock path (doc 15 §25): take the ns captured
+                     * when this event was buffered. No cps / instruction-count
+                     * interpolation — the FPGA already gives real time. */
+                    ns = csb.fpga_ns_buffer[i];
+                }
+                else
+                {
+                    uint64_t interpolation = csb.global_interpolations[i] + (uint64_t)_get_ic_percentage(i);
+                    ns = (uint64_t)((interpolation * 1'000'000'000) / Mortrall::cps);
+                }
                 /* There cannot be two events at the same timestamp, therefore check if ns is smaller than previous ns */
                 /* Note: this should not be necessary with a perfect instruction trace however */
                 if(perf_prev_ns >= ns){

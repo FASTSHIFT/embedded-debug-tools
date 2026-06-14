@@ -14,6 +14,7 @@
 #include <getopt.h>
 #include <time.h>
 #include <set>
+#include <vector>
 #include <iostream>
 #include <fstream>
 #include <cxxabi.h>
@@ -50,6 +51,7 @@ struct
     std::string file;
     std::string elfFile;
     std::string elfBootloaderFile;
+    std::string fpgaTimeFile;            /* per-ETM-byte FPGA wall-clock ns (doc 15 §25) */
     bool outputDebugFile;
     enum verbLevel verbose;
     bool etm{false};
@@ -69,6 +71,12 @@ struct
     struct symbol *symbols_main;         /* symbols from the main elf file */
     struct symbol *symbols_bootloader;   /* symbols from the bootloader elf file */
 } _r;
+
+/* FPGA wall-clock time base (doc 15 §25): one ns per ETM byte, in stream
+ * order, loaded from --fpga-time. _fpga_idx advances as ETM bytes are pumped
+ * to Mortrall. Empty -> feature off (falls back to the cycleCount path). */
+static std::vector<uint64_t> _fpga_ns;
+static size_t _fpga_idx{0};
 
 static Device device;
 
@@ -889,6 +897,18 @@ static void _protocolPump( uint8_t c ,void ( *_pumpITMProcessGeneric )( char ),v
                     {
                         if ( _pumpETMProcessGeneric )
                         {
+                            /* FPGA wall-clock time base (doc 15 §25): each ETM
+                             * byte delivered to Mortrall maps 1:1 to an entry in
+                             * the FPGA ns table, in order. Set the current ns
+                             * before pumping the byte. */
+                            if ( !_fpga_ns.empty() )
+                            {
+                                uint64_t ns = (_fpga_idx < _fpga_ns.size())
+                                              ? _fpga_ns[_fpga_idx]
+                                              : _fpga_ns.back();
+                                Mortrall::set_fpga_ns( ns );
+                                _fpga_idx++;
+                            }
                             _pumpETMProcessGeneric( _r.p.packet[g].d );
                         }else{
                             options.etm = true;
@@ -940,17 +960,23 @@ static struct option _longOptions[] =
     {"debug", required_argument, NULL, 'd'},
     {"verbose", required_argument, NULL, 'v'},
     {"version", no_argument, NULL, 'V'},
+    {"fpga-time", required_argument, NULL, 'F'},
     {NULL, no_argument, NULL, 0}
 };
 bool _processOptions( int argc, char *argv[] )
 {
     int c, optionIndex = 0;
-    while ( ( c = getopt_long ( argc, argv, "a:b:C:Ef:de:hVt:v:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "a:b:C:Ef:de:hVt:v:F:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
             case 'C':
                 options.cps = atoi( optarg ) * 1000;
+                break;
+
+            // ------------------------------------
+            case 'F':
+                options.fpgaTimeFile = optarg;
                 break;
 
             // ------------------------------------
@@ -965,6 +991,7 @@ bool _processOptions( int argc, char *argv[] )
                 fprintf( stdout, "    -t, --tpiu:               <channel>: Use TPIU decoder on specified channel (normally 1)" EOL );
                 fprintf( stdout, "    -v, --verbose:            <level> Verbose mode 0(errors)..3(debug)" EOL );
                 fprintf( stdout, "    -V, --version:            Print version and exit" EOL );
+                fprintf( stdout, "    -F, --fpga-time:          <file>: per-ETM-byte FPGA wall-clock ns (u64 LE); use as time base" EOL );
                 return false;
 
             // ------------------------------------
@@ -1129,6 +1156,29 @@ int main(int argc, char *argv[])
 
     printf("Initialize Mortrall (Instruction tracing)\n");
     mortrall.init(perfetto_trace,ftrace,options.cps, options.verbose,_r.symbols_main,_r.symbols_bootloader,_handleTSFromETM,_switchSymbols,options.dbg_cc);
+
+    /* Load the FPGA wall-clock time base if given (doc 15 §25). One uint64 LE
+     * ns per ETM byte, produced by decode/etm_with_time.py. */
+    if ( options.fpgaTimeFile.size() )
+    {
+        std::ifstream tf(options.fpgaTimeFile, std::ios::binary | std::ios::ate);
+        if ( !tf )
+        {
+            genericsReport( V_ERROR, "Could not open FPGA time file %s" EOL,
+                            options.fpgaTimeFile.c_str() );
+        }
+        else
+        {
+            std::streamsize sz = tf.tellg();
+            tf.seekg(0, std::ios::beg);
+            _fpga_ns.resize(sz / sizeof(uint64_t));
+            tf.read(reinterpret_cast<char*>(_fpga_ns.data()), sz);
+            _fpga_idx = 0;
+            Mortrall::use_fpga_time = true;
+            printf("FPGA time base: %zu ns entries from %s (overrides cycleCount)\n",
+                   _fpga_ns.size(), options.fpgaTimeFile.c_str());
+        }
+    }
 
     stream = streamCreateFile( options.file.c_str() );
     genericsReport( V_INFO, "Process Stream" EOL );
