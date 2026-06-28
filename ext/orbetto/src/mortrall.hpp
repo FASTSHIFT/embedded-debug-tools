@@ -23,6 +23,7 @@
 #include <time.h>
 #include <iomanip>
 #include <cxxabi.h>
+#include <set>
 
 #include "git_version_info.h"
 #include "generics.h"
@@ -140,6 +141,24 @@ class Mortrall
         static inline uint32_t activeCallStackThread;
         static inline std::unordered_map<int, const char *> exception_names;        // Store interrupt names to give each a unique perfetto thread
         static inline Roaring r1;
+
+        /* Vector-table gate (doc 15 §26): on a noisy parallel-trace capture a
+         * corrupted byte can be mis-decoded as a "Branch Address packet WITH
+         * exception bytes", fabricating a bogus exception with a garbage
+         * exception number (e.g. 4/68/450) AND a garbage ISR target. These
+         * fake exceptions open spurious Perfetto tracks and swallow mainline
+         * instructions. We defend by only honouring an exception entry whose
+         * ISR jump target actually lands on a handler registered in the
+         * application's vector table. The set below holds the legitimate
+         * handler entry addresses (thumb bit cleared), with the catch-all
+         * Default_Handler excluded. */
+        static inline std::set<uint32_t> validHandlerEntries;
+        static inline bool vectorTableLoaded{false};
+        /* Per-exception-number handler entry from the vector table (ARM
+         * exception number -> handler address, thumb bit cleared). Lets us
+         * require that a decoded exception's number and its ISR target are
+         * mutually consistent with the table, which noise almost never is. */
+        static inline std::map<int, uint32_t> vectorByException;
 
         /* Data Struct to store information about the current decoding process (used in orbmortem) */
         static inline RunTime *r;
@@ -1005,11 +1024,100 @@ class Mortrall
             _stackReport( Mortrall::r );
         }
 
+        /* Build the set of legitimate exception-handler entry addresses from
+         * the application's vector table held in the loaded ELF image. The
+         * Cortex-M vector table starts at the image base (0x08000000 on the
+         * STM32F4); entry 0 is the initial SP, entries 1.. are handler
+         * addresses with the thumb bit set. We read it straight out of the ELF
+         * code image via symbolCodeAt(). The catch-all Default_Handler (the
+         * address that appears most often, used by every unused weak vector) is
+         * excluded so it cannot legitimise noise. */
+        static void inline _loadVectorTable()
+        {
+            Mortrall::vectorTableLoaded = true;
+            struct symbol *s = Mortrall::r->_s ? Mortrall::r->_s : Mortrall::r->s;
+            if ( !s ) return;
+            /* Locate the vector table base. The reset handler sits in the first
+             * code section; the table base is the lowest mapped code address. */
+            uint32_t base = 0x08000000;
+            unsigned int len = 0;
+            symbolMemptr p = symbolCodeAt( s, base, &len );
+            if ( !p ) return;
+            /* Read up to 256 vectors (16 system + up to ~91 IRQ on F4, padded). */
+            std::map<uint32_t, int> freq;
+            std::vector<uint32_t> entries;
+            const int MAXVEC = 256;
+            for ( int i = 1; i < MAXVEC; i++ )
+            {
+                unsigned int avail = 0;
+                symbolMemptr q = symbolCodeAt( s, base + i * 4, &avail );
+                if ( !q || avail < 4 ) break;
+                uint32_t w = q[0] | (q[1] << 8) | (q[2] << 16) | ((uint32_t)q[3] << 24);
+                if ( w == 0 ) { entries.push_back(0); continue; }
+                uint32_t h = w & ~1u;            /* clear thumb bit */
+                entries.push_back( h );
+                freq[h]++;
+                Mortrall::vectorByException[i] = h;   /* ARM exception number i */
+            }
+            /* The Default_Handler is whichever address is shared by the most
+             * vectors (all unused weak IRQs alias to it). Exclude it. */
+            uint32_t defaultHandler = 0; int best = 1;
+            for ( auto &kv : freq ) if ( kv.second > best ) { best = kv.second; defaultHandler = kv.first; }
+            for ( uint32_t h : entries )
+            {
+                if ( h == 0 || h == defaultHandler ) continue;
+                Mortrall::validHandlerEntries.insert( h );
+            }
+            _traceReport( V_DEBUG, "Vector table: %zu distinct real handlers (Default_Handler 0x%08x excluded)",
+                          Mortrall::validHandlerEntries.size(), defaultHandler );
+        }
+
+        /* Is addr a legitimate exception target, i.e. does it fall inside a
+         * function whose entry point is registered in the vector table?
+         * excNum is the decoded ARM exception number; when it maps to a known
+         * vector we additionally require the target to match that vector's
+         * handler, which rejects noise where number and target are independent
+         * garbage that merely happen to alias some valid handler. */
+        static bool inline _isLegitExceptionTarget( uint32_t addr, int excNum )
+        {
+            if ( !Mortrall::vectorTableLoaded ) _loadVectorTable();
+            if ( Mortrall::validHandlerEntries.empty() ) return true;  /* no table -> don't gate */
+            uint32_t a = addr & ~1u;
+            /* Strong check: the decoded exception number names a real vector,
+             * and the target lands in that exact handler. */
+            auto it = Mortrall::vectorByException.find( excNum );
+            if ( it != Mortrall::vectorByException.end() )
+            {
+                uint32_t want = it->second & ~1u;
+                if ( a == want ) return true;
+                struct symbolFunctionStore *f = symbolFunctionAt( Mortrall::r->s, addr );
+                if ( f && ((uint32_t)f->lowaddr & ~1u) == want ) return true;
+                return false;   /* number is a real vector but target disagrees -> noise */
+            }
+            /* excNum is not a registered vector at all -> bogus. */
+            return false;
+        }
+
         static void inline _handleExceptionEntry()
         {
             /* Handle the context switch after a exception */
             if (Mortrall::r->exceptionEntry)
             {
+                struct TRACECPUState *cpu = TRACECPUState( &Mortrall::r->i );
+                /* Vector-table gate: reject fabricated exceptions caused by
+                 * mis-decoded noise bytes. A genuine exception entry jumps to a
+                 * handler registered in the vector table; the ISR target is the
+                 * address packet we are processing right here (cpu->addr, now in
+                 * workingAddr). If it does not land inside a registered handler,
+                 * this is a spurious "branch-with-exception" decode -- treat it
+                 * as an ordinary branch and do NOT open an exception track. */
+                if ( !_isLegitExceptionTarget( cpu->addr, Mortrall::r->exceptionId ) )
+                {
+                    _traceReport( V_DEBUG, "Rejecting bogus exception %u: target 0x%08x not a vector-table handler",
+                                  Mortrall::r->exceptionId, cpu->addr );
+                    Mortrall::r->exceptionEntry = false;
+                    return;
+                }
                 Mortrall::_generate_protobuf_cycle_counts();
                 /* Check if exception Id is in the map */
                 if(!Mortrall::exception_names.contains(Mortrall::r->exceptionId))
