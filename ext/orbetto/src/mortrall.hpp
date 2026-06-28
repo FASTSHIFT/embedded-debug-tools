@@ -353,9 +353,47 @@ class Mortrall
                         }
                         break;
 
+                    case TRACE_PROT_ETM35:
+
+                        /* ETM3.5 (e.g. Cortex-M4 / STM32F429) differs from ETM4:
+                         * the exception is delivered as a Branch Address packet
+                         * WITH exception bytes, so cpu->addr here is the ISR
+                         * ENTRY (jump destination), not a return address, and
+                         * there is no separate following address packet. The
+                         * return address is simply where we were executing when
+                         * interrupted (the current workingAddr). We capture that
+                         * as returnAddress so the exit can resume correctly, and
+                         * let the EV_CH_ADDRESS block below push the ISR entry
+                         * (cpu->addr) onto the dedicated exception call stack via
+                         * _handleExceptionEntry(). */
+                        _appendToOPBuffer( Mortrall::r, NULL, Mortrall::r->op.currentLine, LT_EVENT,
+                                        "========== Exception Entry (%d (%s) at 0x%08x -> ISR 0x%08x ) ==========",
+                                        cpu->exception, TRACEExceptionName( cpu->exception ),
+                                        Mortrall::r->op.workingAddr, cpu->addr );
+                        Mortrall::r->returnAddress = Mortrall::r->op.workingAddr;
+                        Mortrall::r->exceptionEntry = true;
+                        Mortrall::r->exceptionId = cpu->exception;
+                        break;
+
                     default:
                         _traceReport( V_DEBUG, "Unrecognised trace protocol in exception handler" );
                         break;
+                }
+            }
+
+            /* 2b: Deal with exception EXIT (ETM3.5 has an explicit exit packet,
+             * unlike the PX4/NuttX arm_exception-name heuristic used for ETM4).
+             * On exit, collapse the dedicated exception call stack and switch
+             * back to the interrupted thread, resuming at returnAddress. */
+            if ( ( Mortrall::r->protocol == TRACE_PROT_ETM35 ) &&
+                 TRACEStateChanged( &Mortrall::r->i, EV_CH_EX_EXIT ) )
+            {
+                if ( Mortrall::r->exceptionActive )
+                {
+                    _appendToOPBuffer( Mortrall::r, NULL, Mortrall::r->op.currentLine, LT_EVENT,
+                                    "========== Exception Exit (resume 0x%08x ) ==========",
+                                    Mortrall::r->returnAddress );
+                    _handleExceptionExitETM35();
                 }
             }
 
@@ -887,6 +925,35 @@ class Mortrall
 //--------------------------------------------------------------------------------------//
 //-------------------------------- BEGIN REGION CallStack ------------------------------//
 //--------------------------------------------------------------------------------------//
+
+        static void inline _handleExceptionExitETM35()
+        {
+            /* ETM3.5 explicit exception-exit handling (the 0x76 exit packet,
+             * EV_CH_EX_EXIT). Unlike the ETM4/PX4 path there is no need to
+             * detect the end of an "arm_exception" function by name -- the
+             * hardware tells us. Collapse the dedicated exception call stack and
+             * switch back to the interrupted thread, resuming at returnAddress. */
+            Mortrall::_generate_protobuf_cycle_counts();
+            /* Close any frames still open on the exception call stack so the
+             * ISR (and anything it called) gets proper E events. */
+            while ( Mortrall::r->callStack->stackDepth > 0 )
+            {
+                _removeRetFromStack( Mortrall::r );
+            }
+            _generate_protobuf_entries_single( Mortrall::r->op.workingAddr );
+            _flush_proto_buffer();
+            /* Switch back to the interrupted thread's call stack. */
+            Mortrall::r->callStack = &Mortrall::callstacks[Mortrall::tid];
+            Mortrall::activeCallStackThread = Mortrall::PID_CALLSTACK + Mortrall::tid;
+            r->exceptionActive = false;
+            r->resentStackSwitch = true;
+            /* Resume execution at the interrupted PC. */
+            if ( Mortrall::r->returnAddress )
+            {
+                Mortrall::r->op.workingAddr = Mortrall::r->returnAddress;
+            }
+            _stackReport( Mortrall::r );
+        }
 
         static void inline _handleExceptionEntry()
         {
