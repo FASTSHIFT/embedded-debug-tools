@@ -22,6 +22,7 @@
 #include <functional>
 #include <time.h>
 #include <iomanip>
+#include <cxxabi.h>
 
 #include "git_version_info.h"
 #include "generics.h"
@@ -799,7 +800,7 @@ class Mortrall
                 event = ftrace->add_event();        // create Ftrace event
                 print = event->mutable_print();         // add print
                 event->set_pid(Mortrall::activeCallStackThread);        // set the pid of the event
-                snprintf(buffer, sizeof(buffer), "B|0|%s", next_func->funcname);
+                snprintf(buffer, sizeof(buffer), "B|0|%s", _displayName(next_func->funcname));
                 print->set_buf(buffer);
                 _appendTOProtoBuffer(event,1);      // Use an offset of 1 to compensate for the missing instruction count
             }
@@ -823,6 +824,39 @@ class Mortrall
             return false;
         }
 
+        /* Produce a clean, human-readable display name for a Perfetto slice:
+         * demangle C++ symbols and strip the verbose anonymous-namespace prefix
+         * GCC emits for file-static functions (e.g.
+         * "_ZN29_INTERNAL_8_main_cpp_7e63be9b7mydelayEj" ->
+         * "(anonymous namespace)::mydelay(unsigned int)" -> "mydelay(unsigned int)").
+         * Returns a pointer into a static thread-unsafe scratch buffer (single
+         * threaded decoder, fine). */
+        static const char inline *_displayName(const char *mangled)
+        {
+            static char scratch[256];
+            const char *name = mangled;
+            char *demangled = nullptr;
+            if (mangled && mangled[0] == '_' && mangled[1] == 'Z')
+            {
+                int status = 0;
+                demangled = abi::__cxa_demangle(mangled, 0, 0, &status);
+                if (status == 0 && demangled) name = demangled;
+            }
+            /* Strip a leading "(anonymous namespace)::" if present, and any
+             * "_INTERNAL_<n>_<file>_<hash>::" GCC anon-namespace decoration. */
+            const char *p = name;
+            const char *anon = strstr(p, "(anonymous namespace)::");
+            if (anon) p = anon + strlen("(anonymous namespace)::");
+            else if (strncmp(p, "_INTERNAL_", 10) == 0)
+            {
+                const char *cc = strstr(p, "::");
+                if (cc) p = cc + 2;
+            }
+            snprintf(scratch, sizeof(scratch), "%s", p);
+            if (demangled) free(demangled);
+            return scratch;
+        }
+
         static void inline _generate_protobuf_entries_single(uint32_t addr)
         {
             /* Check whether the stack hight changed and if yes if the changes are commited*/
@@ -841,7 +875,7 @@ class Mortrall
                     event->set_pid(Mortrall::activeCallStackThread);
                     if (top_thread_func)
                     {
-                        snprintf(buffer, sizeof(buffer), "B|0|%s", Mortrall::top_thread_func->funcname);
+                        snprintf(buffer, sizeof(buffer), "B|0|%s", _displayName(Mortrall::top_thread_func->funcname));
                     }else
                     {
                         snprintf(buffer, sizeof(buffer), "B|0|0x%08x", Mortrall::r->op.workingAddr);
