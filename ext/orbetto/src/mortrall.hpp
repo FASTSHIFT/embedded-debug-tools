@@ -863,6 +863,15 @@ class Mortrall
         {
             /* Create Ftrace print event for cycle count packets */
             /* This is mainly for debugging and not needed for correct displaying of the callstack */
+            /* On the FPGA wall-clock path the ETM cycleCount is always 0, so the
+             * (cycleCount*1e9/cps)-1 below underflows to UINT64_MAX and would
+             * inject bogus events at the end of the timeline. These CC markers
+             * are debug-only and meaningless without real cycle counts, so skip
+             * them entirely when using FPGA time. */
+            if ( Mortrall::use_fpga_time )
+            {
+                return;
+            }
             auto *event = ftrace->add_event();
             uint64_t ns = (uint64_t)(((Mortrall::r->i.cpu.cycleCount * 1'000'000'000)/ Mortrall::cps)-1);
             event->set_timestamp(ns);
@@ -899,6 +908,13 @@ class Mortrall
                      * when this event was buffered. No cps / instruction-count
                      * interpolation — the FPGA already gives real time. */
                     ns = csb.fpga_ns_buffer[i];
+                    /* Guard: an event buffered outside the byte-pump (e.g. an
+                     * exception entry/exit emitted before the first byte's ns
+                     * is set, or after the ns table is exhausted) can carry a
+                     * stale/sentinel ns. Anything implausible (effectively
+                     * uninitialized, ~UINT64_MAX) would wreck the Perfetto
+                     * timeline; fall back to monotonic continuation. */
+                    if (ns == (uint64_t)-1 || ns < perf_prev_ns) ns = perf_prev_ns + 1;
                 }
                 else
                 {
