@@ -103,6 +103,7 @@ struct RunTime
     int exceptionId{0};                 /* Exception ID */
     bool exceptionActive{false};        /* Set if we are currently in an exception */
     uint32_t returnAddress{0};          /* Return address for exception */
+    uint32_t exceptionEventCount{0};    /* Events since exception entry (for timeout) */
 
     uint16_t instruction_count{0};      /* Instruction count for precise timing between cycle count packets (Assume all instructions take equally long) */      
 
@@ -414,6 +415,23 @@ class Mortrall
                                     "========== Exception Exit (resume 0x%08x ) ==========",
                                     Mortrall::r->returnAddress );
                     _handleExceptionExitETM35();
+                }
+            }
+
+            /* 2c: Exception timeout safety net (ETM3.5). If an exception entry
+             * was seen but no exit packet arrives within N events, the exit packet
+             * was likely corrupted by unknown bytes. Force-close the exception to
+             * prevent the ISR track from running indefinitely. */
+            if ( Mortrall::r->exceptionActive )
+            {
+                Mortrall::r->exceptionEventCount++;
+                constexpr uint32_t EXC_TIMEOUT_EVENTS = 500;
+                if ( Mortrall::r->exceptionEventCount > EXC_TIMEOUT_EVENTS )
+                {
+                    _traceReport( V_DEBUG, "Exception timeout (%u events without exit), forcing exit",
+                                  Mortrall::r->exceptionEventCount );
+                    _handleExceptionExitETM35();
+                    Mortrall::r->exceptionEventCount = 0;
                 }
             }
 
@@ -1287,6 +1305,22 @@ class Mortrall
 
         static void inline _addRetToStack( RunTime *r, symbolMemaddr p , int num = 0)
         {
+            /* Safety net: if stack depth exceeds a sane limit (noise-induced
+             * missed returns cause unbounded growth), flush the stack and start
+             * fresh from the next anchor. This bounds the "runaway depth" problem
+             * visible in Perfetto when unknown bytes eat E events. */
+            constexpr int MAX_SANE_DEPTH = 16;
+            if ( Mortrall::r->callStack->stackDepth >= MAX_SANE_DEPTH )
+            {
+                _traceReport( V_DEBUG, "Stack depth %d exceeds sane limit %d, flushing",
+                              Mortrall::r->callStack->stackDepth, MAX_SANE_DEPTH );
+                while ( Mortrall::r->callStack->stackDepth > 0 )
+                {
+                    _removeRetFromStack( Mortrall::r );
+                }
+                _generate_protobuf_entries_single( Mortrall::r->op.workingAddr );
+            }
+
             /* Check if Stack is full */
             if ( Mortrall::r->callStack->stackDepth == MAX_CALL_STACK - 1 )
             {
