@@ -78,6 +78,52 @@ struct
 static std::vector<uint64_t> _fpga_ns;
 static size_t _fpga_idx{0};
 
+/* ETM protocol auto-detection (doc: H743 ETMv4 support). During the preprocess
+ * pass we collect the first stretch of demuxed ETM (TPIU channel 2) bytes here,
+ * then _detectEtmProtocol() finds the A-Sync (>=5 zero bytes followed by 0x80)
+ * and inspects the FIRST packet header after it:
+ *   0x01 -> ETMv4 Trace Info packet (always follows a sync in ETMv4)  => ETM4
+ *   0x08 -> ETMv3.5 I-sync packet header                              => ETM35
+ * This distinguishes Cortex-M7 (ETMv4) from Cortex-M4 (ETMv3.5) streams with no
+ * user input. The ORBETTO_ETM_PROT env var still overrides this if set. */
+static std::vector<uint8_t> _etm_prescan;
+static constexpr size_t ETM_PRESCAN_MAX = 65536;
+
+static int _detectEtmProtocol()
+{
+    const auto &b = _etm_prescan;
+    size_t zeros = 0;
+    for ( size_t i = 0; i < b.size(); i++ )
+    {
+        if ( b[i] == 0x00 )
+        {
+            zeros++;
+            continue;
+        }
+        /* A-Sync = a run of >=5 zero bytes terminated by 0x80 (ETMv3.5 uses
+         * 5 zeros + 0x80; ETMv4 uses more, but >=5 covers both). */
+        if ( b[i] == 0x80 && zeros >= 5 )
+        {
+            /* Skip any immediately-following 0x00 padding, then read the first
+             * real packet header. */
+            size_t j = i + 1;
+            while ( j < b.size() && b[j] == 0x00 ) j++;
+            if ( j < b.size() )
+            {
+                uint8_t hdr = b[j];
+                if ( hdr == 0x01 ) return TRACE_PROT_ETM4;   /* Trace Info => ETMv4 */
+                if ( hdr == 0x08 ) return TRACE_PROT_ETM35;  /* I-sync    => ETMv3.5 */
+                /* Any other header right after sync: 0x01 is unique to ETMv4's
+                 * mandatory post-sync Trace Info, so treat a non-0x08 as ETMv4
+                 * only when it is 0x01; otherwise keep scanning for a cleaner
+                 * sync. */
+            }
+        }
+        zeros = 0;
+    }
+    return -1;   /* undetermined */
+}
+
 static Device device;
 
 static perfetto::protos::Trace *perfetto_trace;
@@ -912,6 +958,12 @@ static void _protocolPump( uint8_t c ,void ( *_pumpITMProcessGeneric )( char ),v
                             _pumpETMProcessGeneric( _r.p.packet[g].d );
                         }else{
                             options.etm = true;
+                            /* Preprocess pass: collect ETM bytes for protocol
+                             * auto-detection (only the first ETM_PRESCAN_MAX). */
+                            if ( _etm_prescan.size() < ETM_PRESCAN_MAX )
+                            {
+                                _etm_prescan.push_back( _r.p.packet[g].d );
+                            }
                         }
                         continue;
                     }
@@ -1152,6 +1204,21 @@ int main(int argc, char *argv[])
         _r.symbols = _r.symbols_bootloader;
     }else{
         _r.symbols = _r.symbols_main;
+    }
+
+    /* Auto-detect the ETM protocol from the trace stream collected during the
+     * preprocess pass (Cortex-M4/ETMv3.5 vs Cortex-M7/ETMv4). Feeds Mortrall's
+     * _init(); the ORBETTO_ETM_PROT env var still overrides this. */
+    {
+        int detected = _detectEtmProtocol();
+        if ( detected == TRACE_PROT_ETM4 )
+            printf("ETM protocol auto-detect: ETMv4 (Cortex-M7) [post-sync Trace Info 0x01]\n");
+        else if ( detected == TRACE_PROT_ETM35 )
+            printf("ETM protocol auto-detect: ETMv3.5 (Cortex-M4) [post-sync I-sync 0x08]\n");
+        else
+            printf("ETM protocol auto-detect: inconclusive (%zu ETM bytes prescanned) -> using default/env\n",
+                   _etm_prescan.size());
+        Mortrall::set_auto_protocol( detected );
     }
 
     printf("Initialize Mortrall (Instruction tracing)\n");

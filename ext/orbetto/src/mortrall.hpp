@@ -164,6 +164,13 @@ class Mortrall
         /* Data Struct to store information about the current decoding process (used in orbmortem) */
         static inline RunTime *r;
 
+        /* Auto-detected ETM protocol (set by orbetto's preprocess prescan from
+         * the trace stream's post-A-Sync packet: 0x01 Trace-Info => ETMv4,
+         * 0x08 I-sync => ETMv3.5). -1 = not detected / no override. The
+         * ORBETTO_ETM_PROT env var, if set, takes precedence over this. */
+        static inline int auto_protocol{ -1 };
+        static void inline set_auto_protocol( int p ) { Mortrall::auto_protocol = p; }
+
         /* Callstack elements */
         static inline uint16_t tid;                                                 // current running thread id
         static inline uint16_t pending_tid;                                         // next thread id (gets set after a thread switch pattern has been detected)
@@ -716,12 +723,51 @@ class Mortrall
 
         static void inline _init()
         {
-            /* Init ETM Decoder. NOTE: orbetto upstream hardcodes ETM4 (their
-               STM32F765/H7 targets). Our STM32F429 core is ETMv3.5, and the
-               Mortrall body already handles TRACE_PROT_ETM35 (disposition-bit
-               execution model). Select ETM3.5 here so the A7-Lite ETM stream
-               decodes (doc 15 §20). */
+            /* Init ETM Decoder. orbetto upstream hardcodes ETM4 (their
+               STM32F765/H7 targets). Our STM32F429 core is ETMv3.5, while the
+               STM32H743 (Cortex-M7) is ETMv4 -- the Mortrall body handles BOTH
+               (see the TRACE_PROT_ETM4 / TRACE_PROT_ETM35 branches in exception
+               handling and the instruction-execution model above). Select the
+               protocol at runtime via the ORBETTO_ETM_PROT env var:
+                   ORBETTO_ETM_PROT=etm4   -> Cortex-M7 (STM32H743) ETMv4
+                   ORBETTO_ETM_PROT=etm35  -> Cortex-M4 (STM32F429) ETMv3.5 [default]
+               Selection priority:
+                 1. ORBETTO_ETM_PROT env var (explicit override), else
+                 2. auto_protocol (auto-detected from the trace stream), else
+                 3. default ETM3.5 (keeps the existing F429 A7-Lite flow
+                    unchanged, doc 15 §20). */
             TRACEprotocol trp = TRACE_PROT_ETM35;
+            const char *how = "default";
+
+            if ( Mortrall::auto_protocol == TRACE_PROT_ETM4 ||
+                 Mortrall::auto_protocol == TRACE_PROT_ETM35 )
+            {
+                trp = (TRACEprotocol)Mortrall::auto_protocol;
+                how = "auto-detected";
+            }
+
+            const char *protEnv = getenv( "ORBETTO_ETM_PROT" );
+            if ( protEnv )
+            {
+                if ( !strcasecmp( protEnv, "etm4" ) || !strcasecmp( protEnv, "etmv4" ) )
+                {
+                    trp = TRACE_PROT_ETM4;
+                    how = "env ORBETTO_ETM_PROT";
+                }
+                else if ( !strcasecmp( protEnv, "etm35" ) || !strcasecmp( protEnv, "etmv35" ) ||
+                          !strcasecmp( protEnv, "etm3.5" ) )
+                {
+                    trp = TRACE_PROT_ETM35;
+                    how = "env ORBETTO_ETM_PROT";
+                }
+                else
+                {
+                    fprintf( stderr, "WARN: unknown ORBETTO_ETM_PROT='%s' (use etm4|etm35)\n", protEnv );
+                }
+            }
+
+            fprintf( stderr, "Mortrall: ETM protocol = %s (%s)\n",
+                     ( trp == TRACE_PROT_ETM4 ) ? "ETMv4 (Cortex-M7)" : "ETMv3.5 (Cortex-M4)", how );
             Mortrall::Mortrall::r->protocol = trp;
             TRACEDecoderInit( &Mortrall::Mortrall::r->i, trp, true, _traceReport );
             /* Init Debug counters */
