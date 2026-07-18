@@ -463,6 +463,29 @@ class Mortrall
                 }
                 /* As every Exception Packet is followed by an Address Packet we handle the exception here to keep track of thread switches */
                 _handleExceptionEntry();
+                /* ETMv4 exception RETURN detection (generic, CMSIS-friendly):
+                 * unlike NuttX's arm_exception* dispatcher (caught on an
+                 * indirect JUMP in _handleExceptionExit), a standard CMSIS
+                 * handler (SysTick_Handler, *_IRQHandler) returns via an
+                 * EXC_RETURN that the ETMv4 stream delivers as an ADDRESS
+                 * packet back to the recorded returnAddress. Detect it here so
+                 * the exception slice closes at the true ISR end instead of
+                 * dangling until the 500-event timeout (which made SysTick look
+                 * "smeared" in Perfetto). Match with the thumb 1/2-byte
+                 * tolerance and only while an exception is active. */
+                if ( Mortrall::r->exceptionActive && !Mortrall::r->exceptionEntry )
+                {
+                    uint32_t ra = Mortrall::r->returnAddress & ~1u;
+                    uint32_t na = cpu->addr & ~1u;
+                    if ( na == ra )
+                    {
+                        _appendToOPBuffer( Mortrall::r, NULL, Mortrall::r->op.currentLine, LT_EVENT,
+                                        "========== Exception Exit (resume 0x%08x ) ==========",
+                                        Mortrall::r->returnAddress );
+                        _handleExceptionExitETM35();
+                        Mortrall::r->exceptionEventCount = 0;
+                    }
+                }
                 /*  After it is clear to what location the jump happened add the current function to the top of the stack and update in protobuf */
                 _addTopToStack(Mortrall::r,cpu->addr);
                 /* Update the ProtoBuf entries */
@@ -1204,6 +1227,9 @@ class Mortrall
         {
             /* As there is no exception exit packet the exit has to be detected by ending of the "arm_exception" function */
             /* If highaddr is reached its the end of exception (highaddr might be offset by a 1/2 byte) */
+            /* NB: this NuttX/PX4-specific path catches the arm_exception* dispatcher on an indirect jump.
+             * Standard CMSIS handlers (SysTick_Handler, *_IRQHandler) return via an EXC_RETURN that arrives
+             * as an ADDRESS packet, handled separately in the EV_CH_ADDRESS block (return-to-returnAddress). */
             if(r->exceptionActive && func && strstr(func->funcname,"arm_exception") && (Mortrall::r->op.workingAddr >= (func->highaddr - 0x1f))&& (Mortrall::r->op.workingAddr <= (func->highaddr + 0xf)))
             {
                 Mortrall::_generate_protobuf_cycle_counts();
