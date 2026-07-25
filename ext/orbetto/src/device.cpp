@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "device.hpp"
+
+#include <fcntl.h>
+#include <unistd.h>
+#include <libelf.h>
+#include <gelf.h>
+#include <vector>
+
 using namespace std::literals;
 
 static const Device::IrqTable irq_names_stm32f765 =
@@ -297,43 +304,296 @@ static const Device::RegisterTable registers_stm32h753 =
 };
 
 
-Device::Device(std::string_view hint)
+const char *
+Device::supported()
 {
-    // hint.contains() is only available in C++23
-    if (hint.find("stm32f765") != std::string_view::npos or
-        hint.find("v5x") != std::string_view::npos)
+    return "stm32f765 (v5x), stm32h753 (v6x), stm32h743 (v6s), nuttx";
+}
+
+// ====================================================================================================
+// ELF-derived IRQ table (vendor-agnostic)
+// ====================================================================================================
+
+/* Wrap a built-in static table without taking ownership of it. */
+static std::shared_ptr<const Device::IrqTable>
+_borrow(const Device::IrqTable &t)
+{
+    return std::shared_ptr<const Device::IrqTable>(&t, [](const Device::IrqTable *) {});
+}
+
+/* The Armv7-M / Armv8-M exception vector table (ARMv7-M ARM DDI0403E B1.5.3)
+ * is an array of 32-bit words at the vector table base:
+ *   [0] = initial SP, [1] = Reset, [2] = NMI, [3] = HardFault, ...
+ * i.e. word N (N >= 1) is the handler address for exception number N, which is
+ * exactly the numbering ETM/DWT report. So the ELF alone identifies every
+ * exception: read the vector words out of the loaded sections, then resolve
+ * each address against .symtab to get the handler name.
+ *
+ * This is strictly better than a vendor device database for our purpose: it
+ * reports the handlers the firmware ACTUALLY installed (unused slots collapse
+ * to the shared default handler and are reported as such), and it needs no
+ * per-part table, so any Cortex-M ELF works. What the ELF cannot tell us is
+ * the CPU clock (pass -C) and peripheral register names (DMA annotation only,
+ * degrades to an empty string). */
+namespace {
+
+struct ElfSection
+{
+    uint64_t addr;
+    std::vector<uint8_t> data;
+};
+
+struct FuncSym
+{
+    uint64_t lo, hi;
+    std::string name;
+};
+
+/* Vector table base: the entry-point section's address is where the vectors
+ * live on every Cortex-M linker script we care about, but rather than assume,
+ * find the section that contains e_entry's *pointer* -- i.e. take the lowest
+ * loaded section whose first word looks like a stack pointer (points into RAM)
+ * and whose second word matches a known function. Falls back to e_entry's
+ * containing section start. */
+constexpr uint32_t THUMB_BIT = 1u;
+constexpr int MAX_EXCEPTIONS = 16 + 480;   // Armv7-M: up to 496 exceptions
+
+const std::string *
+_lookup(const std::vector<FuncSym> &syms, uint64_t addr)
+{
+    const std::string *best = nullptr;
+    uint64_t best_lo = 0;
+    for (const auto &s : syms)
     {
-        _irq_table = &irq_names_stm32f765;
+        if (addr >= s.lo and addr <= s.hi and (not best or s.lo >= best_lo))
+        {
+            best = &s.name;
+            best_lo = s.lo;
+        }
+    }
+    return best;
+}
+
+bool
+_readWord(const std::vector<ElfSection> &secs, uint64_t addr, uint32_t &out)
+{
+    for (const auto &s : secs)
+    {
+        if (addr >= s.addr and addr + 4 <= s.addr + s.data.size())
+        {
+            const uint8_t *p = s.data.data() + (addr - s.addr);
+            out = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                  ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+Device
+Device::fromElf(const std::string &elfPath, std::string *err)
+{
+    Device d;
+    const auto fail = [&](const std::string &m) -> Device
+    {
+        if (err) *err = m;
+        return Device{};
+    };
+
+    if (elf_version(EV_CURRENT) == EV_NONE)
+        return fail("libelf version mismatch");
+
+    int fd = open(elfPath.c_str(), O_RDONLY);
+    if (fd < 0)
+        return fail("cannot open " + elfPath);
+
+    Elf *e = elf_begin(fd, ELF_C_READ, NULL);
+    if (not e)
+    {
+        close(fd);
+        return fail("not an ELF: " + elfPath);
+    }
+
+    GElf_Ehdr ehdr;
+    if (gelf_getehdr(e, &ehdr) != &ehdr)
+    {
+        elf_end(e);
+        close(fd);
+        return fail("no ELF header");
+    }
+
+    /* Collect loadable section contents (for reading the vector words) and
+     * STT_FUNC symbols (for naming the handlers). */
+    std::vector<ElfSection> secs;
+    std::vector<FuncSym> syms;
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(e, scn)) != NULL)
+    {
+        GElf_Shdr shdr;
+        if (gelf_getshdr(scn, &shdr) != &shdr) continue;
+
+        if (shdr.sh_type == SHT_PROGBITS and (shdr.sh_flags & SHF_ALLOC) and shdr.sh_size)
+        {
+            Elf_Data *data = elf_getdata(scn, NULL);
+            if (data and data->d_buf)
+            {
+                ElfSection s;
+                s.addr = shdr.sh_addr;
+                const uint8_t *b = (const uint8_t *)data->d_buf;
+                s.data.assign(b, b + data->d_size);
+                secs.push_back(std::move(s));
+            }
+        }
+        else if (shdr.sh_type == SHT_SYMTAB)
+        {
+            Elf_Data *data = elf_getdata(scn, NULL);
+            int nsym = shdr.sh_entsize ? (int)(shdr.sh_size / shdr.sh_entsize) : 0;
+            for (int i = 0; i < nsym; i++)
+            {
+                GElf_Sym sym;
+                if (gelf_getsym(data, i, &sym) != &sym) continue;
+                if (GELF_ST_TYPE(sym.st_info) != STT_FUNC) continue;
+                const char *nm = elf_strptr(e, shdr.sh_link, sym.st_name);
+                if (not nm or not nm[0]) continue;
+                uint64_t lo = sym.st_value & ~(uint64_t)THUMB_BIT;
+                /* zero-size symbols (common for asm handlers) still name their
+                 * exact entry address */
+                uint64_t hi = lo + (sym.st_size ? sym.st_size - 1 : 0);
+                syms.push_back({lo, hi, std::string(nm)});
+            }
+        }
+    }
+
+    if (syms.empty())
+    {
+        elf_end(e);
+        close(fd);
+        return fail("ELF has no .symtab STT_FUNC symbols (stripped?)");
+    }
+
+    /* Locate the vector table: it is the section holding the word that points
+     * at the reset handler, i.e. vectors[1] == e_entry. Scan section starts. */
+    uint64_t vecbase = 0;
+    const uint64_t entry = ehdr.e_entry & ~(uint64_t)THUMB_BIT;
+    for (const auto &s : secs)
+    {
+        uint32_t w1;
+        if (_readWord(secs, s.addr + 4, w1) and (w1 & ~THUMB_BIT) == entry)
+        {
+            vecbase = s.addr;
+            break;
+        }
+    }
+
+    if (not vecbase)
+    {
+        elf_end(e);
+        close(fd);
+        return fail("no vector table found (no section whose word[1] == e_entry "
+                    "0x" + std::to_string(entry) + ")");
+    }
+
+    /* Walk the vectors. The table length is not recorded anywhere, so stop at
+     * the first word that is not a plausible handler pointer (must resolve to a
+     * function symbol). Slot 0 is the initial SP, so start at 1. */
+    auto table = std::make_shared<IrqTable>();
+    int16_t maxirq = 0;
+    int resolved = 0;
+    for (int n = 1; n < MAX_EXCEPTIONS; n++)
+    {
+        uint32_t w;
+        if (not _readWord(secs, vecbase + 4ull * n, w)) break;
+        if (not w or w == 0xFFFFFFFFu) continue;   // reserved/empty slot
+        const std::string *nm = _lookup(syms, w & ~THUMB_BIT);
+        if (not nm) break;                         // past the end of the table
+        (*table)[(int16_t)n] = *nm;
+        maxirq = (int16_t)n;
+        resolved++;
+    }
+
+    elf_end(e);
+    close(fd);
+
+    if (resolved < 8)
+        return fail("vector table at 0x" + std::to_string(vecbase) +
+                    " resolved only " + std::to_string(resolved) + " handlers");
+
+    d._irq_table = table;
+    d._max_irq = maxirq;
+    d._clock = 0;                 // not derivable from an ELF; pass -C
+    d._register_table = nullptr;  // peripheral names are vendor data
+    d._id = DeviceId::GENERIC_ELF;
+    d._origin = elfPath + " vector table (" + std::to_string(resolved) +
+                " handlers, max exception " + std::to_string(maxirq) + ")";
+    return d;
+}
+
+// ====================================================================================================
+// Built-in device tables (fallback when the ELF has no usable vector table)
+// ====================================================================================================
+
+/* Device selection is an EXPLICIT choice (--device / ORBETTO_DEVICE).
+ * It used to be inferred by substring-matching the ELF *filename*, which meant
+ * any ELF not named after a known target silently failed the
+ * assert(device.valid()) in main() -- the build name and the target choice were
+ * needlessly coupled. Match on the device name only. */
+Device::Device(std::string_view name)
+{
+    // name.contains() is only available in C++23
+    if (name.find("stm32f765") != std::string_view::npos or
+        name.find("v5x") != std::string_view::npos)
+    {
+        _irq_table = _borrow(irq_names_stm32f765);
         // FIXME
         // _register_table = &registers_stm32f765;
         _max_irq = 16+109;
         _clock = 216'000'000;
         _id = DeviceId::SYKNODE_V5X;
+        _origin = "built-in table stm32f765";
     }
-    else if (hint.find("stm32h753") != std::string_view::npos or
-             hint.find("v6x") != std::string_view::npos)
+    else if (name.find("stm32h753") != std::string_view::npos or
+             name.find("v6x") != std::string_view::npos)
     {
-        _irq_table = &irq_names_stm32h753;
+        _irq_table = _borrow(irq_names_stm32h753);
         _register_table = &registers_stm32h753;
         _max_irq = 16+149;
         _clock = 480'000'000;
         _id = DeviceId::SYKNODE_V6X;
+        _origin = "built-in table stm32h753";
     }
-    else if (hint.find("stm32h743") != std::string_view::npos or
-             hint.find("v6s") != std::string_view::npos)
+    else if (name.find("stm32h743") != std::string_view::npos or
+             name.find("v6s") != std::string_view::npos)
     {
-        _irq_table = &irq_names_stm32h753;
+        _irq_table = _borrow(irq_names_stm32h753);
         _register_table = &registers_stm32h753;
         _max_irq = 16+149;
         _clock = 480'000'000;
         _id = DeviceId::SKYNODE_V6S;
+        _origin = "built-in table stm32h743";
     }
     // this was used in a pure NuttX build as ETM test
-    else if (hint.find("nuttx") != std::string_view::npos)
+    else if (name.find("nuttx") != std::string_view::npos)
     {
-        _irq_table = &irq_names_stm32f765;
+        _irq_table = _borrow(irq_names_stm32f765);
         _max_irq = 16+109;
         _clock = 48'000'000;
         _id = DeviceId::SYKNODE_V5X;
+        _origin = "built-in table nuttx";
+    }
+}
+
+/* Peripheral register annotation is the only genuinely vendor-specific piece
+ * left. Attach it to an ELF-derived device on request so DMA slices keep their
+ * source/destination names. */
+void
+Device::attachRegisterTable(std::string_view name)
+{
+    if (name.find("stm32h7") != std::string_view::npos or
+        name.find("v6s") != std::string_view::npos or
+        name.find("v6x") != std::string_view::npos)
+    {
+        _register_table = &registers_stm32h753;
     }
 }

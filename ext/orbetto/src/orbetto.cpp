@@ -52,6 +52,7 @@ struct
     std::string elfFile;
     std::string elfBootloaderFile;
     std::string fpgaTimeFile;            /* per-ETM-byte FPGA wall-clock ns (doc 15 §25) */
+    std::string device;                  /* target device name (--device / ORBETTO_DEVICE) */
     bool outputDebugFile;
     enum verbLevel verbose;
     bool etm{false};
@@ -92,7 +93,15 @@ static constexpr size_t ETM_PRESCAN_MAX = 65536;
 static int _detectEtmProtocol()
 {
     const auto &b = _etm_prescan;
+    /* Majority vote over ALL A-syncs in the prescan, not just the first. On a
+     * SPARSE stream (e.g. BB-OFF filtered trace, doc/proposal 36) the first
+     * A-sync may sit right at the end of the prescan window with no clean
+     * header after it, so first-match returned -1 and the caller wrongly fell
+     * back to the ETMv3.5 default -- decoding an ETMv4 (M7) stream as v3.5
+     * yields garbage. Counting every A-sync's following header makes detection
+     * robust on sparse streams. */
     size_t zeros = 0;
+    int v4 = 0, v35 = 0;
     for ( size_t i = 0; i < b.size(); i++ )
     {
         if ( b[i] == 0x00 )
@@ -104,24 +113,19 @@ static int _detectEtmProtocol()
          * 5 zeros + 0x80; ETMv4 uses more, but >=5 covers both). */
         if ( b[i] == 0x80 && zeros >= 5 )
         {
-            /* Skip any immediately-following 0x00 padding, then read the first
-             * real packet header. */
             size_t j = i + 1;
             while ( j < b.size() && b[j] == 0x00 ) j++;
             if ( j < b.size() )
             {
                 uint8_t hdr = b[j];
-                if ( hdr == 0x01 ) return TRACE_PROT_ETM4;   /* Trace Info => ETMv4 */
-                if ( hdr == 0x08 ) return TRACE_PROT_ETM35;  /* I-sync    => ETMv3.5 */
-                /* Any other header right after sync: 0x01 is unique to ETMv4's
-                 * mandatory post-sync Trace Info, so treat a non-0x08 as ETMv4
-                 * only when it is 0x01; otherwise keep scanning for a cleaner
-                 * sync. */
+                if ( hdr == 0x01 ) v4++;        /* Trace Info => ETMv4 */
+                else if ( hdr == 0x08 ) v35++;  /* I-sync    => ETMv3.5 */
             }
         }
         zeros = 0;
     }
-    return -1;   /* undetermined */
+    if ( v4 == 0 && v35 == 0 ) return -1;       /* no A-sync seen at all */
+    return ( v4 >= v35 ) ? TRACE_PROT_ETM4 : TRACE_PROT_ETM35;
 }
 
 static Device device;
@@ -1013,17 +1017,23 @@ static struct option _longOptions[] =
     {"verbose", required_argument, NULL, 'v'},
     {"version", no_argument, NULL, 'V'},
     {"fpga-time", required_argument, NULL, 'F'},
+    {"device", required_argument, NULL, 'D'},
     {NULL, no_argument, NULL, 0}
 };
 bool _processOptions( int argc, char *argv[] )
 {
     int c, optionIndex = 0;
-    while ( ( c = getopt_long ( argc, argv, "a:b:C:Ef:de:hVt:v:F:", _longOptions, &optionIndex ) ) != -1 )
+    while ( ( c = getopt_long ( argc, argv, "a:b:C:D:Ef:de:hVt:v:F:", _longOptions, &optionIndex ) ) != -1 )
         switch ( c )
         {
             // ------------------------------------
             case 'C':
                 options.cps = atoi( optarg ) * 1000;
+                break;
+
+            // ------------------------------------
+            case 'D':
+                options.device = optarg;
                 break;
 
             // ------------------------------------
@@ -1044,6 +1054,9 @@ bool _processOptions( int argc, char *argv[] )
                 fprintf( stdout, "    -v, --verbose:            <level> Verbose mode 0(errors)..3(debug)" EOL );
                 fprintf( stdout, "    -V, --version:            Print version and exit" EOL );
                 fprintf( stdout, "    -F, --fpga-time:          <file>: per-ETM-byte FPGA wall-clock ns (u64 LE); use as time base" EOL );
+                fprintf( stdout, "    -D, --device:             <name>: target device for IRQ/register names." EOL );
+                fprintf( stdout, "                              Supported: %s" EOL, Device::supported() );
+                fprintf( stdout, "                              May also be set via the ORBETTO_DEVICE env var." EOL );
                 return false;
 
             // ------------------------------------
@@ -1150,9 +1163,81 @@ int main(int argc, char *argv[])
     ITMDecoderInit( &_r.i, true );
     MSGSeqInit( &_r.d, &_r.i, MSG_REORDER_BUFLEN );
 
-    device = Device(options.elfFile);
-    assert(device.valid());
+    /* Exception names come from the ELF's own Cortex-M vector table (word N =
+     * handler for exception N, resolved through .symtab). Vendor-agnostic and
+     * it reports the handlers the firmware actually installed, so no device
+     * database is needed for the common case.
+     *
+     * This used to be a built-in per-part table selected by substring-matching
+     * the ELF *filename*, which coupled the build name to the target choice:
+     * any ELF not named after a known device tripped assert(device.valid()).
+     * The built-in tables remain as an explicit fallback (-D/--device) for
+     * stripped ELFs, and supply the peripheral register names used to annotate
+     * DMA slices, which an ELF cannot provide. */
+    if ( options.device.empty() )
+    {
+        if ( const char *e = getenv( "ORBETTO_DEVICE" ); e && *e )
+        {
+            options.device = e;
+        }
+    }
+
+    if ( !options.elfFile.empty() )
+    {
+        std::string elfErr;
+        device = Device::fromElf( options.elfFile, &elfErr );
+
+        if ( device.valid() )
+        {
+            genericsReport( V_INFO, "Exception names from %s" EOL,
+                            device.origin().c_str() );
+
+            /* Optional vendor extra: peripheral register names for DMA slices. */
+            if ( !options.device.empty() )
+            {
+                device.attachRegisterTable( options.device );
+            }
+        }
+        else
+        {
+            genericsReport( V_WARN, "Could not derive exceptions from ELF (%s)" EOL,
+                            elfErr.c_str() );
+        }
+    }
+
+    if ( !device.valid() )
+    {
+        /* Fall back to a built-in table; requires an explicit device name. */
+        if ( options.device.empty() )
+        {
+            genericsReport( V_ERROR, "No exception names available: the ELF has no "
+                            "usable vector table and no device was given. Use "
+                            "-D/--device <name>. Supported: %s" EOL,
+                            Device::supported() );
+            exit( -1 );
+        }
+
+        device = Device( options.device );
+
+        if ( !device.valid() )
+        {
+            genericsReport( V_ERROR, "Unknown target device '%s'. Supported: %s" EOL,
+                            options.device.c_str(), Device::supported() );
+            exit( -1 );
+        }
+
+        genericsReport( V_INFO, "Exception names from %s" EOL,
+                        device.origin().c_str() );
+    }
+
     if (options.cps == 0) options.cps = device.clock();
+
+    if ( options.cps == 0 )
+    {
+        genericsReport( V_ERROR, "CPU frequency unknown (an ELF does not record it): "
+                        "pass -C/--cpufreq <KHz>" EOL );
+        exit( -1 );
+    }
 
     perfetto_trace = new perfetto::protos::Trace();
     auto *ftrace_packet = perfetto_trace->add_packet();
