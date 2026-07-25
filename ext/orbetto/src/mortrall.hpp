@@ -1380,7 +1380,13 @@ class Mortrall
             /* Safety net: if stack depth exceeds a sane limit (noise-induced
              * missed returns cause unbounded growth), flush the stack and start
              * fresh from the next anchor. This bounds the "runaway depth" problem
-             * visible in Perfetto when unknown bytes eat E events. */
+             * visible in Perfetto when unknown bytes eat E events.
+             * NB (r32 E1 observation): this safety net is also the direct driver
+             * of the "coremark_main appears N times at depth 16.5" signature in
+             * Perfetto -- see docs/artix7-port/proposals/42 §3 / reviews/r32*.
+             * Root cause (33% of iBR pops later reverted, stack[] contents
+             * clobbered by _addTopToStack) is fixed only by the larger stack-
+             * model refactor; this safety net keeps depth bounded until then. */
             constexpr int MAX_SANE_DEPTH = 16;
             if ( Mortrall::r->callStack->stackDepth >= MAX_SANE_DEPTH )
             {
