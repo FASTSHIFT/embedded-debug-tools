@@ -78,6 +78,7 @@ struct
  * to Mortrall. Empty -> feature off (falls back to the cycleCount path). */
 static std::vector<uint64_t> _fpga_ns;
 static size_t _fpga_idx{0};
+static bool _fpga_exhausted{false};   /* reported once if we outrun the table */
 
 /* ETM protocol auto-detection (doc: H743 ETMv4 support). During the preprocess
  * pass we collect the first stretch of demuxed ETM (TPIU channel 2) bytes here,
@@ -953,6 +954,24 @@ static void _protocolPump( uint8_t c ,void ( *_pumpITMProcessGeneric )( char ),v
                              * before pumping the byte. */
                             if ( !_fpga_ns.empty() )
                             {
+                                /* Running past the end of the table means the
+                                 * producer (decode/etm_with_time.py) deframed
+                                 * the capture differently than we just did, so
+                                 * every timestamp from here on is wrong -- the
+                                 * axis freezes at the last value and slices end
+                                 * up 1ns apart. Clamping silently hid a real
+                                 * deframer mismatch once; make it loud. */
+                                if ( _fpga_idx >= _fpga_ns.size() && !_fpga_exhausted )
+                                {
+                                    _fpga_exhausted = true;
+                                    genericsReport( V_ERROR,
+                                        "FPGA time base exhausted after %zu ETM bytes "
+                                        "but the stream has more: the ns table was built "
+                                        "by a DIFFERENT TPIU deframer than ours. "
+                                        "Timestamps beyond this point are invalid." EOL,
+                                        _fpga_ns.size() );
+                                }
+
                                 uint64_t ns = (_fpga_idx < _fpga_ns.size())
                                               ? _fpga_ns[_fpga_idx]
                                               : _fpga_ns.back();
@@ -1332,6 +1351,19 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* Second pass over the SAME file, so the protocol decoders must start from
+     * a clean slate. Without this reset the TPIU decoder carried its state from
+     * the end of the preprocess pass (state=RXING, a partially filled frame,
+     * and currentStream from the last frame) into byte 0 of the second pass, so
+     * the bytes before the first sync -- which a fresh decoder discards -- were
+     * emitted as frame data. Measured: 11824 stream-2 bytes delivered vs 11816
+     * for a single-pass deframe of the same file, the 8 extra being a bogus
+     * pre-sync frame at the very start. That also skewed the -F time base,
+     * which is indexed by ETM byte. */
+    TPIUDecoderInit( &_r.t );
+    ITMDecoderInit( &_r.i, true );
+    MSGSeqInit( &_r.d, &_r.i, MSG_REORDER_BUFLEN );
+
     stream = streamCreateFile( options.file.c_str() );
     genericsReport( V_INFO, "Process Stream" EOL );
     while ( true )
@@ -1487,6 +1519,23 @@ int main(int argc, char *argv[])
         std::ofstream perfetto_debug("orbetto.debug", std::ios::out);
         perfetto_debug << perfetto_trace->DebugString();
         perfetto_debug.close();
+    }
+
+    /* Sanity-check the time base against what we actually consumed: the ns
+     * table is indexed by ETM byte, so a size difference means the producer's
+     * deframer disagrees with ours and the whole axis is skewed. */
+    if ( !_fpga_ns.empty() )
+    {
+        printf("FPGA time base: consumed %zu of %zu ns entries\n",
+               _fpga_idx, _fpga_ns.size());
+
+        if ( _fpga_idx != _fpga_ns.size() )
+        {
+            genericsReport( V_WARN, "FPGA time base size mismatch (%zu ETM bytes "
+                            "decoded vs %zu ns entries): rebuild the ns table with "
+                            "the same TPIU deframer" EOL,
+                            _fpga_idx, _fpga_ns.size() );
+        }
     }
 
     printf("Serializing into 'orbetto.perf'\n");
