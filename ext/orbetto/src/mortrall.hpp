@@ -952,11 +952,21 @@ class Mortrall
                                     symbolFunctionAt( Mortrall::r->s, Mortrall::r->callStack->stack[d] );
                                 if ( df && !strcmp( df->funcname, next_func->funcname ) )
                                 {
-                                    /* Emit the missing E| for each frame we unwind,
-                                     * so perfetto depth tracks the real returns. */
+                                    /* Unwind the stack to that frame. Emit E| ONLY
+                                     * for levels perfetto actually has open
+                                     * (perfettoStackDepth), so B|/E| stay balanced
+                                     * -- these frames were opened as real slices
+                                     * only up to perfettoStackDepth; popping below
+                                     * that must not emit spurious E| (that was the
+                                     * -352 imbalance in the first cut). */
                                     while ( Mortrall::r->callStack->stackDepth > d )
                                     {
-                                        _emitEnd();
+                                        if ( Mortrall::r->callStack->perfettoStackDepth
+                                             >= Mortrall::r->callStack->stackDepth )
+                                        {
+                                            _emitEnd();
+                                            Mortrall::r->callStack->perfettoStackDepth--;
+                                        }
                                         _removeRetFromStack( Mortrall::r );
                                     }
                                     Mortrall::top_thread_func = next_func;
