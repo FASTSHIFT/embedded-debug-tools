@@ -912,6 +912,19 @@ class Mortrall
             }
         }
 
+        /* r33 fix B helper: emit a single slice-end (E|0) into the proto buffer,
+         * used when unwinding frames whose return atom was mis-decoded. */
+        static void inline _emitEnd()
+        {
+            auto *event = ftrace->add_event();
+            auto *print = event->mutable_print();
+            char buffer[8];
+            event->set_pid(Mortrall::activeCallStackThread);
+            snprintf(buffer, sizeof(buffer), "E|0");
+            print->set_buf(buffer);
+            _appendTOProtoBuffer(event);
+        }
+
         static bool inline _inconsistentFunctionSwitch(uint32_t addr)
         {
             /* Check whether a function switch on the same stack depth happend */
@@ -919,6 +932,38 @@ class Mortrall
                 struct symbolFunctionStore *next_func = symbolFunctionAt( Mortrall::r->s, addr );
                 if(top_thread_func && next_func && strcmp(next_func->funcname, top_thread_func->funcname))
                 {
+                        /* r33 fix B (missed-return recovery): if we are "switching"
+                         * to the ENTRY of a function that already sits deeper in
+                         * the stack, this is not a real same-level switch -- it is
+                         * a return whose iBR atom was mis-decoded as not-taken
+                         * (r33 §3: pop {pc} judged not-taken, workingAddr walked
+                         * past into the literal pool up to a function entry). The
+                         * correct action is to POP back to that function's frame,
+                         * not to rename the slice in place (which is what produced
+                         * the 358 false coremark_main re-entries). Only trigger on
+                         * a genuine function ENTRY (addr == lowaddr) found below
+                         * the top, so normal same-level tail-switches are
+                         * unaffected. */
+                        if ( addr == next_func->lowaddr )
+                        {
+                            for ( int d = Mortrall::r->callStack->stackDepth - 1; d >= 0; d-- )
+                            {
+                                struct symbolFunctionStore *df =
+                                    symbolFunctionAt( Mortrall::r->s, Mortrall::r->callStack->stack[d] );
+                                if ( df && !strcmp( df->funcname, next_func->funcname ) )
+                                {
+                                    /* Emit the missing E| for each frame we unwind,
+                                     * so perfetto depth tracks the real returns. */
+                                    while ( Mortrall::r->callStack->stackDepth > d )
+                                    {
+                                        _emitEnd();
+                                        _removeRetFromStack( Mortrall::r );
+                                    }
+                                    Mortrall::top_thread_func = next_func;
+                                    return true;
+                                }
+                            }
+                        }
                         _traceReport( V_DEBUG, "Inconsistent function switch detected between functions: %s and %s\n", next_func->funcname, top_thread_func->funcname);
                         /* Switch the functions in perfetto trace */
                         _handleInconsistentFunctionSwitch(next_func,addr);
