@@ -247,6 +247,7 @@ class Mortrall
             }
             Mortrall::cycleCountThreshold = ccth;
             Mortrall::_init();
+            Mortrall::_selfCheckInit();
             Mortrall::initialized = true;
             /* Report successful initialization */
             _traceReport( V_DEBUG, "Mortrall initialized" EOL);
@@ -264,6 +265,7 @@ class Mortrall
         
         void inline finalize(auto *process_tree)
         {
+            _selfCheckReport();
             if(Mortrall::initialized)
             {
                 /* Commit all changes */
@@ -329,6 +331,36 @@ class Mortrall
             enum instructionClass ic;
             symbolMemaddr newaddr;
 
+
+            /* self-check (P0-3): correlate overflow/trace-on with iBR failures.
+             * Pure diagnostic, no behavior change. An overflow marks a gap where
+             * P0 elements were lost; until the next ADDRESS packet re-anchors
+             * workingAddr, any atom walked is against a stale disposition. */
+            if ( selfcheck_mode > 0 )
+            {
+                /* NON-destructive: TRACEStateChanged() clears the flag, which
+                 * would steal the event from the real handlers below. Peek the
+                 * raw changeRecord bitfield instead. */
+                uint32_t cr = Mortrall::r->i.cpu.changeRecord;
+                if ( cr & ( 1u << EV_CH_OVERFLOW ) )
+                {
+                    sc_overflow++;
+                    sc_reanchored_since_ovf = false;
+                }
+                if ( cr & ( 1u << EV_CH_TRACESTART ) )
+                {
+                    sc_traceon++;
+                    sc_seen_traceon = true;
+                }
+                if ( cr & ( 1u << EV_CH_ADDRESS ) )
+                {
+                    sc_reanchored_since_ovf = true;
+                }
+                /* remember (non-destructively) whether THIS callback carries an
+                 * ADDRESS re-anchor, for the batch-entry context dump below */
+                sc_cb_has_addr = ( cr & ( 1u << EV_CH_ADDRESS ) ) != 0;
+                if ( sc_drift_seen ) sc_cbs_since_drift++;
+            }
 
             /* Check for Cycle Count update to reset instruction count*/
             if (TRACEStateChanged( &Mortrall::r->i, EV_CH_CYCLECOUNT) )
@@ -492,6 +524,16 @@ class Mortrall
                 _generate_protobuf_entries_single(cpu->addr);
                 /* Report the Stack for debugging */
                 _stackReport(Mortrall::r);
+                /* P0-3b-1 (r35): log the re-anchor timing/mismatch after drift */
+                if ( selfcheck_mode > 0 && sc_drift_seen && sc_addr_after_drift_logged < 40 )
+                {
+                    sc_addr_after_drift_logged++;
+                    uint32_t oldwa = Mortrall::r->op.workingAddr;
+                    fprintf(stderr, "[SC-ADDR] after-drift #%d: old_wa=%08x cpu_addr=%08x "
+                            "match=%d atoms_since_drift=%ld cbs_since_drift=%ld\n",
+                            sc_addr_after_drift_logged, oldwa, (unsigned)cpu->addr,
+                            (oldwa == cpu->addr), sc_atoms_since_drift, sc_cbs_since_drift);
+                }
                 /* Whatever the state was, this is an explicit setting of an address, so we need to respect it */
                 Mortrall::r->op.workingAddr = cpu->addr;        // Update working address from addr packet
                 Mortrall::r->exceptionEntry = false;            // Reset exception entry flag
@@ -517,6 +559,14 @@ class Mortrall
                 /* program flow (and which point the disposition bit tells you if that jump was taken or not).                                */
                 incAddr = cpu->eatoms + cpu->natoms;
                 disposition = cpu->disposition;
+                if ( selfcheck_mode > 0 )
+                {
+                    sc_new_batch = true;
+                    sc_batch_entry_wa = Mortrall::r->op.workingAddr;
+                    /* did this same callback also carry an ADDRESS re-anchor? */
+                    sc_batch_had_addr = sc_cb_has_addr;
+                    sc_batch_entry_addr = cpu->addr;
+                }
             }
 
             /* 4: Execute the flow instructions */
@@ -596,6 +646,19 @@ class Mortrall
                 if ( a )
                 {
                     _add_pc(Mortrall::r->op.workingAddr);
+                    _selfCheck(Mortrall::r->op.workingAddr, a);
+                    /* P0-3b-1b ring-buffer push (before disposition is consumed) */
+                    if ( selfcheck_mode > 0 && !sc_drift_seen )
+                    {
+                        scStep &s = sc_ring[sc_ring_head];
+                        s.wa = Mortrall::r->op.workingAddr; s.ic = ic;
+                        s.insExec = ( ( !(ic & LE_IC_JUMP) ) || ( disposition & 1 ) );
+                        s.disp = disposition; s.incAddr = incAddr;
+                        s.newbatch = sc_new_batch ? 1 : 0;
+                        sc_new_batch = false;
+                        sc_ring_head = ( sc_ring_head + 1 ) % 96;
+                        if ( sc_ring_cnt < 96 ) sc_ring_cnt++;
+                    }
                     /* Calculate if this instruction was executed. This is slightly hairy depending on which protocol we're using;         */
                     /*   * ETM3.5: Instructions are executed based on disposition bit (LSB in disposition word)                            */
                     /*   * ETM4  : ETM4 everything up to a branch is executed...decision about that branch is based on disposition bit     */
@@ -628,6 +691,7 @@ class Mortrall
 
                         disposition >>= 1;
                         incAddr--;
+                        if ( selfcheck_mode > 0 && sc_drift_seen ) sc_atoms_since_drift++;
                     }
 
                     if ( ic & LE_IC_CALL )
@@ -683,6 +747,67 @@ class Mortrall
                         else
                         {
                             /* The branch wasn't taken, so just move along */
+                            /* self-check (proposal 43 §18): an iBR (JUMP & !IMMEDIATE,
+                             * i.e. pop{pc}/bx lr return) judged NOT-taken is the exact
+                             * fingerprint of the batch-boundary bug (§13): the return's
+                             * E-atom fell in the next EV_CH_ENATOMS batch, so this
+                             * fall-through drifts into the literal pool. Immediate
+                             * conditional branches (bne/cbz) legitimately fall through
+                             * and are NOT counted. */
+                            if ( selfcheck_mode > 0 && !( ic & LE_IC_IMMEDIATE ) )
+                            {
+                                sc_ibr_nottaken++;
+                                /* Batch-boundary discriminator: incAddr already
+                                 * decremented above (625-633). ==0 means this iBR
+                                 * consumed the LAST atom of the current batch -- the
+                                 * §13 fingerprint. >0 means atoms remained, so a
+                                 * genuine conditional indirect not-taken. */
+                                if ( incAddr == 0 ) sc_ibr_batchend++;
+                                /* P0-3 overflow correlation */
+                                if ( !sc_reanchored_since_ovf ) sc_ibr_after_ovf++;
+                                if ( !sc_seen_traceon ) sc_ibr_pre_traceon++;
+                                /* Sample the distinct trigger addresses so we can
+                                 * disassemble them offline and confirm uncond-return
+                                 * vs genuine conditional indirect. */
+                                if ( selfcheck_mode > 0 )
+                                    fprintf(stderr, "[SC-IBR] addr=%08x incAddr=%d disp=%08x\n",
+                                            (unsigned)Mortrall::r->op.workingAddr, incAddr, disposition);
+                                /* P0-3b-1: arm the drift clock at the first failure */
+                                if ( !sc_drift_seen )
+                                {
+                                    sc_drift_seen = true;
+                                    sc_atoms_since_drift = 0;
+                                    sc_cbs_since_drift = 0;
+                                    /* P0-3b-1b: dump the ring buffer (context BEFORE
+                                     * the failing iBR) so we can see how the atom
+                                     * batch was consumed leading into the drift. */
+                                    fprintf(stderr, "[SC-RING] context before FIRST drift "
+                                            "(oldest->newest, batch_entry_wa=%08x had_addr=%d addr=%08x):\n",
+                                            sc_batch_entry_wa, sc_batch_had_addr, sc_batch_entry_addr);
+                                    int n = sc_ring_cnt;
+                                    int idx = ( sc_ring_head - n + 96 ) % 96;
+                                    for ( int k = 0; k < n; k++ )
+                                    {
+                                        scStep &s = sc_ring[idx];
+                                        fprintf(stderr, "  %s wa=%08x ic=%03x exec=%d disp=%08x incAddr=%d\n",
+                                                s.newbatch ? "[BATCH]" : "       ",
+                                                s.wa, s.ic, s.insExec, s.disp, s.incAddr);
+                                        idx = ( idx + 1 ) % 96;
+                                    }
+                                }
+                                if ( !sc_ibr_reported )
+                                {
+                                    sc_ibr_reported = true;
+                                    uint32_t wa = Mortrall::r->op.workingAddr;
+                                    struct symbolFunctionStore *f = symbolFunctionAt(Mortrall::r->s, wa);
+                                    fprintf(stderr, "[SELFCHECK] FIRST iBR-not-taken (batch-boundary "
+                                            "fingerprint): iBR@%08x (func=%s) incAddr=%d disp=%08x "
+                                            "-> fall-through to %08x\n", wa, f?f->funcname:"?",
+                                            incAddr, disposition,
+                                            (unsigned)(wa + ((ic & LE_IC_4BYTE)?4:2)));
+                                    if ( selfcheck_mode >= 2 ) { fflush(stderr); abort(); }
+                                }
+                            }
                             Mortrall::r->op.workingAddr += ( ic & LE_IC_4BYTE ) ? 4 : 2;
                         }
                     }
@@ -1346,6 +1471,7 @@ class Mortrall
                 if ( Mortrall::r->callStack->stackDepth < MAX_CALL_STACK - 1 )
                 {
                     Mortrall::r->callStack->stackDepth++;
+                    if ( selfcheck_mode > 0 ) sc_revert++;  /* self-check: speculative pop undone (not a real pop) */
                 }
             }
         }
@@ -1463,6 +1589,7 @@ class Mortrall
 
             /* Add address to stack */
             Mortrall::r->callStack->stack[Mortrall::r->callStack->stackDepth] = p;
+            sc_push++;                          /* self-check: count pushes */
             /* Debug print */
             _traceReport( V_DEBUG, "Pushed %08x to return stack", Mortrall::r->callStack->stack[Mortrall::r->callStack->stackDepth]);
             /* Increment stack depth */
@@ -1478,7 +1605,26 @@ class Mortrall
             /* This needs to be the case for every exception callStack after it is exited */
             if ( Mortrall::r->callStack->stackDepth >= 0 )
             {
+                /* self-check (proposal 43 §17): a pop while depth==0 is an
+                 * underflow -- popping a return address that was never pushed.
+                 * This is the structural source of balance<0. Report the FIRST
+                 * one with full context (addr/func) so the trigger is pinned. */
+                if ( selfcheck_mode > 0 && Mortrall::r->callStack->stackDepth == 0 )
+                {
+                    sc_pop_underflow++;
+                    if ( !sc_underflow_reported )
+                    {
+                        sc_underflow_reported = true;
+                        uint32_t wa = Mortrall::r->op.workingAddr;
+                        struct symbolFunctionStore *f = symbolFunctionAt(Mortrall::r->s, wa);
+                        fprintf(stderr, "[SELFCHECK] FIRST pop-underflow: depth 0->-1 "
+                                "workingAddr=%08x (func=%s) committed=%d\n",
+                                wa, f?f->funcname:"?", Mortrall::r->committed);
+                        if ( selfcheck_mode >= 2 ) { fflush(stderr); abort(); }
+                    }
+                }
                 Mortrall::r->callStack->stackDepth--;
+                sc_pop++;                       /* self-check: count pops */
                 _traceReport( V_DEBUG, "Popped %08x from return stack", Mortrall::r->callStack->stack[Mortrall::r->callStack->stackDepth]);
             }
         }
@@ -1557,6 +1703,115 @@ class Mortrall
                 genericsReport( V_DEBUG, "%s" EOL, op );
             }
         }
+        /* ---- runtime self-check (proposal 43 §17) ------------------------
+         * Verify decoder invariants on every instruction so the FIRST violation
+         * is pinpointed (with full context) instead of only seeing the inflated
+         * end result. Pure diagnostic: reports, never changes decode behavior.
+         * Enable with env MORTRALL_SELFCHECK=1 (=2 also aborts on first breach).
+         * Counters are summarised at finalize().
+         *   inv1  workingAddr is a real instruction (has a source line) -- a
+         *         drift into a literal pool (.word) is the pop-misdecode signature
+         *   inv2  push/pop balance (tracked in _addRetToStack/_removeRetFromStack)
+         *   inv3  stack depth within sane bounds (hitting MAX_SANE_DEPTH/
+         *         MAX_CALL_STACK is a symptom, counted here)
+         * The check is cheap; it runs only when the env flag is set. */
+        static inline int   selfcheck_mode = -1;   /* -1 = not yet read env */
+        static inline long  sc_instr = 0, sc_inv1 = 0, sc_inv3_sane = 0, sc_inv3_full = 0;
+        static inline long  sc_push = 0, sc_pop = 0, sc_pop_underflow = 0, sc_revert = 0;
+        static inline long  sc_ibr_nottaken = 0, sc_ibr_batchend = 0;
+        static inline bool  sc_first_reported = false;
+        static inline bool  sc_underflow_reported = false;
+        static inline bool  sc_ibr_reported = false;
+        /* Overflow/trace-on correlation (P0-3): after an EV_CH_OVERFLOW the
+         * decoder loses P0 elements; if mortrall does not resync its
+         * disposition/incAddr + workingAddr, the atom stream and instruction
+         * stream desync until the next ADDRESS packet re-anchors. sc_since_ovf
+         * counts events since the last overflow; sc_ibr_after_ovf counts
+         * iBR-not-taken failures that occur while still un-re-anchored. */
+        static inline long  sc_overflow = 0, sc_traceon = 0;
+        static inline long  sc_ibr_after_ovf = 0, sc_ibr_pre_traceon = 0;
+        static inline bool  sc_seen_traceon = false;
+        static inline bool  sc_reanchored_since_ovf = true;
+        /* P0-3b-1 (r35): distinguish "never resync" vs "re-anchor too late" vs
+         * "3rd mechanism". After the FIRST iBR-not-taken drift, log every
+         * EV_CH_ADDRESS: (old workingAddr, cpu->addr, matched?, how many atoms
+         * and callbacks walked since the drift before this ADDRESS arrived).
+         * If ADDRESS arrives immediately with a matching addr -> re-anchor is
+         * timely (drift is elsewhere). If it arrives after many atoms walked
+         * with a MISMATCH -> re-anchor is too late (hypothesis 2). */
+        static inline bool  sc_drift_seen = false;
+        static inline long  sc_atoms_since_drift = 0;   /* atoms consumed since drift */
+        static inline long  sc_cbs_since_drift = 0;     /* callbacks since drift */
+        static inline int   sc_addr_after_drift_logged = 0;  /* cap the log volume */
+        /* P0-3b-1b (r35 follow-up): ring buffer of the last N instructions walked
+         * so at the FIRST drift we can dump the context BEFORE the failing iBR --
+         * showing how the atom batch was consumed leading up to it (was the batch
+         * mis-consumed by an earlier instruction, or was workingAddr already wrong
+         * on entry?). Pure diagnostic. */
+        struct scStep { uint32_t wa; uint32_t ic; int insExec; uint32_t disp; int incAddr; int newbatch; };
+        static inline scStep sc_ring[96];
+        static inline int    sc_ring_head = 0;
+        static inline int    sc_ring_cnt = 0;
+        static inline bool   sc_new_batch = false;
+        static inline uint32_t sc_batch_entry_wa = 0;   /* workingAddr at batch entry */
+        static inline uint32_t sc_batch_entry_addr = 0; /* cpu->addr if ADDRESS event */
+        static inline bool   sc_batch_had_addr = false;
+        static inline bool   sc_cb_has_addr = false;
+
+        static void inline _selfCheckInit()
+        {
+            if (selfcheck_mode < 0)
+            {
+                const char *e = getenv("MORTRALL_SELFCHECK");
+                selfcheck_mode = (e && *e) ? atoi(e) : 0;
+            }
+        }
+
+        static void inline _selfCheck(uint32_t wa, const char *asmfound)
+        {
+            if (selfcheck_mode <= 0) return;
+            sc_instr++;
+            /* inv1: workingAddr must map to a real instruction line. A drift into
+             * the literal pool (.word after a mis-decoded return) has no line. */
+            bool has_line = (symbolLineAt(Mortrall::r->s, wa) != NULL);
+            if (!has_line && asmfound)
+            {
+                sc_inv1++;
+                if (!sc_first_reported)
+                {
+                    sc_first_reported = true;
+                    struct symbolFunctionStore *f = symbolFunctionAt(Mortrall::r->s, wa);
+                    fprintf(stderr, "[SELFCHECK] FIRST inv1 breach: workingAddr=%08x "
+                            "(func=%s depth=%d) -- decoding a non-line addr "
+                            "(literal pool drift?)\n", wa, f?f->funcname:"?",
+                            Mortrall::r->callStack->stackDepth);
+                    if (selfcheck_mode >= 2) { fflush(stderr); abort(); }
+                }
+            }
+            /* inv3: depth bounds (symptom counters) */
+            if (Mortrall::r->callStack->stackDepth >= 16)   sc_inv3_sane++;
+            if (Mortrall::r->callStack->stackDepth >= MAX_CALL_STACK-1) sc_inv3_full++;
+        }
+
+        static void inline _selfCheckReport()
+        {
+            if (selfcheck_mode <= 0) return;
+            fprintf(stderr,
+                "[SELFCHECK] instrs=%ld  inv1(non-line drift)=%ld  "
+                "push=%ld pop=%ld revert=%ld (net-balance=%ld raw-balance=%ld)  "
+                "pop-underflow(depth0)=%ld  iBR-not-taken=%ld (batch-end=%ld)  "
+                "depth>=16 hits=%ld  depth>=MAX hits=%ld\n",
+                sc_instr, sc_inv1, sc_push, sc_pop, sc_revert,
+                sc_push - sc_pop + sc_revert, sc_push - sc_pop,
+                sc_pop_underflow, sc_ibr_nottaken, sc_ibr_batchend,
+                sc_inv3_sane, sc_inv3_full);
+            fprintf(stderr,
+                "[SELFCHECK] overflows=%ld trace-on=%ld  "
+                "iBR-not-taken after-overflow(un-re-anchored)=%ld  "
+                "iBR-not-taken before-first-trace-on=%ld\n",
+                sc_overflow, sc_traceon, sc_ibr_after_ovf, sc_ibr_pre_traceon);
+        }
+
         static void inline _stackReport(RunTime *r)
         {
             /* Only append if verbose is actually wanted to save execution time */
